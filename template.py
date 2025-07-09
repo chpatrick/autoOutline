@@ -2,10 +2,12 @@
 # when importing things that are not isntalled by default, you need to update requirements.txt
 import cv2
 import numpy as np
-import skimage.transform
+import numpy.linalg as la
 from concurrent.futures import ThreadPoolExecutor
 import os
 from tqdm import tqdm
+import scipy.optimize
+import math
 
 
 def computeOutline(picture, circleRadiusApproximate):
@@ -19,10 +21,12 @@ def computeOutline(picture, circleRadiusApproximate):
 
 
     # Load grayscale image
-    img = cv2.imread(picture, cv2.IMREAD_GRAYSCALE).astype(np.float32)
+    img = cv2.imread(str(picture), cv2.IMREAD_GRAYSCALE).astype(np.float32)
 
     ksize = 9 # Increase this to reduce noise before binarization.
-    point_sampling_factor = 50 # Take every nth point to speed up circle calculation.
+    optimization_iters = 20 # Basin-hopping iteration count.
+    optimization_step_scale = 0.04 # Basin-hopping step scale relative to image size.
+    optimization_seed = 0xDEADBEEF # Basin-hopping RNG seed.
 
     # Compute variance around each pixel.
     local_mean = cv2.blur(img, ksize=(ksize, ksize))
@@ -32,37 +36,53 @@ def computeOutline(picture, circleRadiusApproximate):
     # Find the high-variance region with Otsu's binarization
     _threshold_val, variance_thresh = cv2.threshold(local_variance.astype(np.uint16), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Find white pixels surrounded mostly by black (like the edge of the disk).
-    var_blur = cv2.blur(variance_thresh, ksize=(18, 18))
-    edgy = (np.bitwise_and(variance_thresh != 0, var_blur < 128)).astype(np.uint8) * 255
+    var_ys, var_xs = np.nonzero(variance_thresh)
+    points = np.transpose([ var_xs, var_ys ])
 
-    test_radii = np.arange(img.shape[0] // 4, img.shape[0] // 2)
+    centroid = np.mean(points, axis=0)
 
-    def try_radius(radius):
-        edgy_circles = skimage.transform.hough_circle(
-            edgy,
-            radius=[ radius ],
-            normalize=False,
-        )
+    center_distances = la.norm(points - centroid, axis=1)
 
-        return skimage.transform.hough_circle_peaks(
-            hspaces=edgy_circles,
-            radii=[ radius ],
-            normalize=False,
-            num_peaks=1,
-        )
+    # In a disk points are on average R / 1.5 from its center.
+    # Since our points are uniformly sampled in every direction, we can use this to roughly estimate the radius.
+    radius_guess = 1.5 * np.mean(center_distances)
 
-    most_votes = 0
-    best_center_x = 0
-    best_center_y = 0
-    best_radius = 0
+    def try_circle(args):
+        center = args[:2]
+        radius = args[2]
 
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-        for votes, center_x, center_y, radius in tqdm(executor.map(try_radius, test_radii), desc="Fitting circles", total=len(test_radii)):
-            if votes[0] > most_votes:
-                most_votes = votes[0]
-                best_center_x = center_x[0]
-                best_center_y = center_y[0]
-                best_radius = radius[0]
+        distances_squared = np.sum((points - center)**2, axis=1)
 
-    return best_radius, (best_center_x, best_center_y)
+        # Estimate the density of inliers inside this candidate disk.
+        is_in = distances_squared < radius**2
+        num_in = np.count_nonzero(is_in)
+        area = math.pi * radius**2
+
+        in_density = num_in / area
+
+        # Estimate the density of outliers in an annulus around the candidate disk.
+        around_radius = radius * 1.1
+        num_around = np.count_nonzero(np.logical_and(np.logical_not(is_in), distances_squared < around_radius**2))
+
+        around_area = math.pi * around_radius**2 - area
+
+        around_density = num_around / around_area
+
+        # The loss is the outlier density minus the inlier density.
+        return around_density - in_density
+
+    # Optimize the initial rough guess.
+    result = scipy.optimize.basinhopping(
+      func=try_circle,
+      x0=np.array([ centroid[0], centroid[1], radius_guess ]),
+      niter=optimization_iters,
+      stepsize=max(img.shape[0], img.shape[1]) * optimization_step_scale,
+      minimizer_kwargs={"method": "COBYLA"},
+      seed=optimization_seed,
+    )
+
+    cx, cy, radius = result.x
+
+    radius -= ksize / 2
+
+    return radius, ( cx, cy )
